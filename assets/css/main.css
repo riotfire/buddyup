@@ -1,0 +1,108 @@
+/* Import Bulma */
+@import 'bulma/css/bulma.min.css';
+
+/* Custom CSS Variables */
+:root {
+  --primary-color: #00d1b2;
+  --secondary-color: #3273dc;
+  --background-color: #ffffff;
+  --text-color: #4a4a4a;
+}
+
+/* Dark mode overrides */
+.dark-mode {
+  --primary-color: #00d1b2;
+  --secondary-color: #3273dc;
+  --background-color: #121212;
+  --text-color: #ffffff;
+}
+
+/* Global styles */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen-Sans, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+  color: var(--text-color);
+  background-color: var(--background-color);
+}
+
+/* Custom utility classes */
+.content-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+.card {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+}
+
+.card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+}
+
+.card-image img {
+  object-fit: cover;
+  height: 200px;
+  width: 100%;
+}
+
+/* Bottom Navigation */
+.bottom-nav {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: white;
+  border-top: 1px solid #dbdbdb;
+  padding: 0.5rem;
+}
+
+.bottom-nav-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  color: #4a4a4a;
+  text-decoration: none;
+  font-size: 0.75rem;
+}
+
+.bottom-nav-item.is-active {
+  color: var(--primary-color);
+}
+
+/* Search bar custom styles */
+.search-input {
+  padding-left: 2.5rem !important;
+}
+
+.search-icon {
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #7a7a7a;
+}
+
+/* Category filters */
+.category-filters {
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 1rem;
+  -webkit-overflow-scrolling: touch;
+}
+
+.category-button {
+  margin-right: 0.5rem;
+  display: inline-block;
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text-color: #ecf0f1;
+    --background-color: #1a1a1a;
+  }
+} 
