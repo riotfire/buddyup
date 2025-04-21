@@ -1,6 +1,6 @@
 import { OpenAI } from 'openai'
 import { $fetch } from 'ofetch'
-import { getWeatherForecast, extractDatesFromQuery } from './weather'
+import { getWeatherForecast as getWeather, extractDatesFromQuery } from './weather'
 
 interface ClassificationResponse {
   route: 'EXTERNAL_SEARCH' | 'AI_ONLY'
@@ -15,101 +15,104 @@ interface SearchConfig {
 
 const config: SearchConfig = {
   confidenceThreshold: 0.85,
-  timeoutMs: 10000,
+  timeoutMs: 8000, // 8 seconds total maximum
   maxRetries: 2
 }
 
+const API_TIMEOUT_MS = 10000; // 10 seconds per API call
+
+// Helper function to timeout a promise
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => 
+      setTimeout(() => reject(new Error(errorMessage)), timeoutMs)
+    )
+  ]);
+}
+
+export type SearchResultType = 'INFORMATION' | 'NEWS' | 'RECOMMENDATIONS' | 'REVIEWS' | 'DIRECTIONS' | 'ERROR'
+
 interface SearchResult {
-  content: string
-  type: 'information' | 'news' | 'recommendations' | 'reviews' | 'directions' | 'error'
-  citations?: Array<{
-    title: string
-    url: string
-  }>
-  isExternalSearch: boolean
-  steps?: Array<{
-    title: string
-    content: string
-  }>
-  timestamp?: string
-  isLive?: boolean
-  title?: string
-  summary?: string
-  items?: Array<{
-    title: string
-    image: string
-    tags: string[]
-    distance: string
-    price: string
-  }>
-  rating?: number
-  reviewCount?: number
-  pros?: string[]
-  cons?: string[]
-  options?: Array<{
-    type: string
-    steps: Array<{
-      transport: string
-      description: string
-      duration: string
-      distance: string
-    }>
-  }>
-  debug?: {
-    classificationModel: string
-    responseModel: string
-    route: 'EXTERNAL_SEARCH' | 'AI_ONLY'
-    confidence: number
-    searchProvider?: string
-    steps: {
-      classification: {
-        model: string
-        response: ClassificationResponse
-        rawResponse: any
-      }
-      externalSearch?: {
-        provider: string
-        query: string
-        response: any
-      }
-      weather?: {
-        startDate: string
-        endDate: string
-        forecast: string
-      }
-      finalResponse: {
-        model: string
-        context: string
-        weatherContext: string
-        temperature: number
-        maxTokens: number
-      }
-    }
+  type: SearchResultType;
+  content: string;
+  context: Record<string, any>;
+}
+
+interface ExternalSearchResponse {
+  answer?: string;
+  results?: Array<{
+    title: string;
+    url: string;
+    content: string;
+  }>;
+  error?: boolean;
+}
+
+interface DateRange {
+  startDate: string;
+  endDate: string;
+}
+
+interface ClassificationResult {
+  choices: Array<{
+    message: {
+      content: string;
+    };
+  }>;
+}
+
+interface SearchError {
+  message: string;
+  code?: string;
+  status?: number;
+}
+
+// Helper function to check environment
+function isProduction(): boolean {
+  return process.env.NODE_ENV === 'production';
+}
+
+// Helper function to get weather forecast
+async function getWeatherForecast(query: string): Promise<string | null> {
+  const dateRange = extractDatesFromQuery(query)
+  if (!dateRange || !dateRange.startDate || !dateRange.endDate) return null
+  
+  try {
+    return await getWeather(dateRange.startDate, dateRange.endDate)
+  } catch (error) {
+    console.error('Error getting weather forecast:', error)
+    return null
+  }
+}
+
+async function performExternalSearch(query: string): Promise<ExternalSearchResponse | null> {
+  try {
+    const response = await $fetch('/api/external-search', {
+      method: 'POST',
+      body: { query }
+    })
+    return response as ExternalSearchResponse
+  } catch (error) {
+    console.error('Error performing external search:', error)
+    return null
   }
 }
 
 export async function searchRouter(query: string): Promise<SearchResult> {
-  try {
-    // Check for dates in the query and get weather if found
-    const dates = extractDatesFromQuery(query)
-    let weatherContext = ''
-    if (dates) {
-      weatherContext = await getWeatherForecast(dates.startDate, dates.endDate)
-    }
+  const startTime = Date.now();
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-    // Classification step
-    const classificationResponse = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-4',
-        messages: [
-          {
-            role: 'system',
-            content: `Classify whether this query needs external, real-time search data or can be answered using contextual AI alone.
+  try {
+    // Run classification and date extraction concurrently
+    const [classificationResult, dateRange] = await Promise.all([
+      withTimeout(
+        openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [
+            {
+              role: 'system',
+              content: `Classify whether this query needs external, real-time search data or can be answered using contextual AI alone.
 
 Consider a query as requiring external search if it involves ANY of these aspects:
 1. Time-sensitive information (events, schedules, "this weekend", "today", etc.)
@@ -122,79 +125,144 @@ Respond in JSON format with:
 {
   "route": "EXTERNAL_SEARCH" or "AI_ONLY",
   "confidence": 0.0-1.0
-}
+}`
+            },
+            { role: 'user', content: query }
+          ],
+          temperature: 0.1,
+          max_tokens: 50
+        }),
+        API_TIMEOUT_MS,
+        'Classification timeout'
+      ),
+      extractDatesFromQuery(query)
+    ]).catch(error => {
+      console.error('Initial concurrent operations error:', error);
+      return [{
+        choices: [{ message: { content: JSON.stringify({ route: 'AI_ONLY', confidence: 0 }) } }]
+      }, null] as [ClassificationResult, DateRange | null];
+    });
 
-For time-sensitive queries, especially those about events or current activities, always route to EXTERNAL_SEARCH with high confidence.`
-          },
-          { role: 'user', content: query }
-        ],
-        temperature: 0.1,
-        max_tokens: 50
-      })
-    })
-
-    const classificationData = await classificationResponse.json()
     const classification: ClassificationResponse = JSON.parse(
-      classificationData.choices[0].message.content
-    )
+      classificationResult.choices[0].message.content || '{"route":"AI_ONLY","confidence":0}'
+    );
 
-    const needsExternalSearch = classification.route === 'EXTERNAL_SEARCH'
+    const needsExternalSearch = classification.route === 'EXTERNAL_SEARCH';
+    
+    // Get weather info if dates are mentioned
+    const weatherForecast = dateRange?.startDate && dateRange?.endDate 
+      ? await getWeather(
+          dateRange.startDate, 
+          dateRange.endDate
+        )
+      : undefined
+    if (weatherForecast) {
+      console.log('Weather info:', weatherForecast)
+    }
 
-    let searchContext = ''
-    let citations = []
-    let externalSearchResponse = null
-
+    // Run external search if needed
+    let externalSearchResult: ExternalSearchResponse | null = null
     if (needsExternalSearch) {
       try {
-        const tavilyResponse = await fetch('https://api.tavily.com/search', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${process.env.TAVILY_API_KEY}`,
-          },
-          body: JSON.stringify({
-            query: `${query} NYC`,
-            search_depth: 'advanced',
-            include_answer: true,
-            include_raw_content: false,
-            max_results: 5,
-          })
-        })
-
-        const tavilyData = await tavilyResponse.json()
-        searchContext = tavilyData.answer
-        citations = tavilyData.results.map((result: any) => ({
-          title: result.title,
-          url: result.url
-        }))
-        externalSearchResponse = {
-          answer: tavilyData.answer,
-          results: tavilyData.results.map((result: any) => ({
-            title: result.title,
-            url: result.url,
-            content: result.content
-          }))
-        }
-      } catch (error) {
-        console.error('External search error:', error)
-        searchContext = '[Note: External search data unavailable. Response may be incomplete.]'
-        externalSearchResponse = {
-          error: error instanceof Error ? error.message : 'Unknown error'
-        }
+        externalSearchResult = await withTimeout(
+          fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'api-key': process.env.TAVILY_API_KEY || ''
+            },
+            body: JSON.stringify({
+              query,
+              search_depth: 'advanced',
+              include_answer: true,
+              include_raw_content: false,
+              include_images: false
+            })
+          }).then(res => res.json()),
+          API_TIMEOUT_MS,
+          'External search timeout'
+        )
+      } catch (err) {
+        console.error('External search error:', err)
+        externalSearchResult = null
       }
     }
 
-    // Generate response with GPT-4
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
-    })
+    let searchContext = '';
+    let citations: Array<{ title: string; url: string; content: string }> = []
+    if (needsExternalSearch && externalSearchResult) {
+      if (externalSearchResult.answer) {
+        searchContext = externalSearchResult.answer
+      }
+      if (externalSearchResult.results) {
+        citations.push(...externalSearchResult.results)
+      }
+    }
 
-    const stream = await openai.chat.completions.create({
-      model: 'gpt-4',
-      messages: [
-        {
-          role: 'system',
-          content: `You are a knowledgeable NYC guide. Analyze the query and respond in the most appropriate format:
+    // Check remaining time for final response
+    const remainingTime = config.timeoutMs - (Date.now() - startTime);
+    if (remainingTime < 1000) {
+      throw new Error('Insufficient time for final response');
+    }
+
+    // Final response generation
+    let content = '';
+    if (process.env.NODE_ENV === 'production') {
+      const response = await withTimeout(
+        openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [
+            {
+              role: 'system',
+              content: `You are a knowledgeable NYC guide. Analyze the query and respond in the most appropriate format:
+
+1. For factual information or how-to questions, use the INFORMATION format:
+{
+  "type": "information",
+  "content": "Clear, concise answer",
+  "steps": [
+    {"title": "Step 1", "content": "Step content"}
+  ]
+}
+
+2. For time-sensitive updates or events, use the NEWS format:
+{
+  "type": "news",
+  "title": "Headline",
+  "summary": "Brief summary",
+  "content": "Full content"
+}
+
+3. For suggestions or options, use the RECOMMENDATIONS format:
+{
+  "type": "recommendations",
+  "items": [
+    {
+      "title": "Place name",
+      "tags": ["tag1"],
+      "distance": "0.5 miles",
+      "price": "$$"
+    }
+  ]
+}${weatherForecast ? '\n\nWeather information:\n' + weatherForecast : ''}${searchContext ? '\n\nContext:\n' + searchContext : ''}`
+            },
+            { role: 'user', content: query }
+          ],
+          temperature: 0.7,
+          max_tokens: 500 // Reduced for production
+        }),
+        remainingTime,
+        'Final response generation timeout'
+      );
+      content = response.choices[0].message.content || '';
+    } else {
+      const stream = await withTimeout(
+        openai.chat.completions.create({
+          model: 'gpt-4',
+          messages: [
+            {
+              role: 'system',
+              content: `You are a knowledgeable NYC guide. Analyze the query and respond in the most appropriate format:
 
 1. For factual information or how-to questions, use the INFORMATION format:
 {
@@ -255,41 +323,64 @@ For time-sensitive queries, especially those about events or current activities,
       ]
     }
   ]
-}${weatherContext ? '\n\nWeather information:\n' + weatherContext : ''}${searchContext ? '\n\nUse this context to inform your response:' + searchContext : ''}`
-        },
-        { role: 'user', content: query }
-      ],
-      stream: true,
-      temperature: 0.7,
-      max_tokens: 1000
-    })
+}${weatherForecast ? '\n\nWeather information:\n' + weatherForecast : ''}${searchContext ? '\n\nContext:\n' + searchContext : ''}`
+            },
+            { role: 'user', content: query }
+          ],
+          stream: true,
+          temperature: 0.7,
+          max_tokens: 1000
+        }),
+        remainingTime,
+        'Final response generation timeout'
+      );
 
-    let content = ''
-    for await (const chunk of stream) {
-      const chunkContent = chunk.choices[0]?.delta?.content || ''
-      if (chunkContent) {
-        content += chunkContent
+      for await (const chunk of stream as any) {
+        const chunkContent = chunk.choices[0]?.delta?.content || '';
+        if (chunkContent) {
+          content += chunkContent;
+        }
       }
     }
 
-    // Parse the JSON response and ensure it has the required fields
-    const response = JSON.parse(content)
-    
-    // Ensure the response has the required type field
-    if (!response.type) {
-      response.type = 'information'
+    // Parse and validate response
+    let response;
+    try {
+      response = JSON.parse(content);
+    } catch (error) {
+      console.error('Failed to parse response:', error);
+      response = {
+        type: 'information',
+        content: content
+      };
     }
 
-    // Ensure the response has the required content field
+    // Ensure required fields
+    if (!response.type) {
+      response.type = 'information';
+    }
     if (!response.content) {
-      response.content = content
+      response.content = content;
+    }
+
+    if (!response || !response.content) {
+      const errorResult: SearchResult = {
+        type: 'ERROR',
+        content: 'Failed to generate a valid response. Please try again or rephrase your question.',
+        context: {
+          errorMessage: 'Invalid response format',
+          errorCode: 'INVALID_RESPONSE',
+          errorStatus: 500
+        }
+      };
+      return errorResult;
     }
 
     return {
       ...response,
       isExternalSearch: needsExternalSearch,
       citations,
-      debug: process.env.NODE_ENV === 'development' ? {
+      debug: !isProduction() ? {
         classificationModel: 'gpt-4',
         responseModel: 'gpt-4',
         route: classification.route,
@@ -299,30 +390,41 @@ For time-sensitive queries, especially those about events or current activities,
           classification: {
             model: 'gpt-4',
             response: classification,
-            rawResponse: classificationData
+            rawResponse: classificationResult
           },
           externalSearch: needsExternalSearch ? {
             provider: 'Tavily',
-            query: `${query} NYC`,
-            response: externalSearchResponse
+            query: query,
+            response: externalSearchResult
           } : undefined,
-          weather: dates ? {
-            startDate: dates.startDate,
-            endDate: dates.endDate,
-            forecast: weatherContext
+          weather: dateRange ? {
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+            forecast: weatherForecast
           } : undefined,
           finalResponse: {
             model: 'gpt-4',
             context: searchContext,
-            weatherContext,
+            weatherContext: weatherForecast,
             temperature: 0.7,
-            maxTokens: 1000
+            maxTokens: isProduction() ? 500 : 1000
           }
         }
       } : undefined
-    }
-  } catch (error: unknown) {
-    console.error('Search router error:', error)
-    throw new Error(`Search router error: ${error instanceof Error ? error.message : 'Unknown error'}`)
+    };
+  } catch (err) {
+    console.error('Search router error:', err);
+    const searchError: SearchError = {
+      message: err instanceof Error ? err.message : 'An unknown error occurred',
+      code: 'SEARCH_ERROR',
+      status: 500
+    };
+
+    const errorResult: SearchResult = {
+      type: 'ERROR',
+      content: `I encountered an error while processing your request: ${searchError.message}. Please try again or rephrase your question.`,
+      context: searchError
+    };
+    return errorResult;
   }
 } 
